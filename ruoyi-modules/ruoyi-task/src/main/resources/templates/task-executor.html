@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>任务执行监控</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            background-color: #fff;
+            padding: 20px;
+            border-radius: 5px;
+            box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+        }
+        
+        h1 {
+            text-align: center;
+            color: #333;
+        }
+        
+        .input-section {
+            margin-bottom: 20px;
+            display: flex;
+            gap: 10px;
+        }
+        
+        textarea {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            resize: vertical;
+        }
+        
+        button {
+            padding: 10px 20px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        
+        button:hover {
+            background-color: #45a049;
+        }
+        
+        .analysis-section {
+            margin-top: 20px;
+            padding: 15px;
+            background-color: #f9f9f9;
+            border-left: 4px solid #2196F3;
+            margin-bottom: 20px;
+        }
+        
+        .task {
+            margin: 10px 0;
+            padding: 15px;
+            border-radius: 5px;
+            border: 1px solid #ddd;
+        }
+        
+        .task.pending { background-color: #f8f9fa; }
+        .task.running { background-color: #fff3cd; }
+        .task.completed { background-color: #d1e7dd; }
+        .task.failed { background-color: #f8d7da; }
+        
+        .task h3 {
+            margin-top: 0;
+            color: #333;
+        }
+        
+        .result {
+            margin-top: 10px;
+            padding: 10px;
+            background-color: #f5f5f5;
+            border-radius: 4px;
+        }
+        
+        pre {
+            white-space: pre-wrap;
+            word-break: break-word;
+            margin: 0;
+        }
+        
+        #finalResult {
+            margin-top: 30px;
+            padding: 20px;
+            border: 2px solid #4CAF50;
+            border-radius: 5px;
+            background-color: #f0f7f0;
+            display: none;
+        }
+        
+        .spinner {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(0, 0, 0, 0.1);
+            border-radius: 50%;
+            border-top-color: #4CAF50;
+            animation: spin 1s ease-in-out infinite;
+            margin-left: 10px;
+            vertical-align: middle;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>任务执行监控</h1>
+        
+        <div class="input-section">
+            <textarea id="userInput" rows="4" placeholder="输入任务描述..."></textarea>
+            <button id="executeBtn">执行任务</button>
+        </div>
+        
+        <div id="analysis" class="analysis-section" style="display:none;"></div>
+        <div id="tasks"></div>
+        <div id="finalResult"></div>
+    </div>
+    
+    <script>
+        document.getElementById('executeBtn').addEventListener('click', function() {
+            const userInput = document.getElementById('userInput').value.trim();
+            if (!userInput) {
+                alert('请输入任务描述');
+                return;
+            }
+            
+            // 显示执行按钮的加载状态
+            this.disabled = true;
+            this.innerHTML = '执行中 <span class="spinner"></span>';
+            
+            // 清空之前的结果
+            document.getElementById('analysis').style.display = 'none';
+            document.getElementById('analysis').innerHTML = '';
+            document.getElementById('tasks').innerHTML = '';
+            document.getElementById('finalResult').style.display = 'none';
+            document.getElementById('finalResult').innerHTML = '';
+            
+            // 编码用户输入以便作为URL参数
+            const encodedInput = encodeURIComponent(userInput);
+            
+            // 创建SSE连接
+            const baseUrl = window.location.origin;
+            const evtSource = new EventSource(`${baseUrl}/system/task/executeAsync?userInput=${encodedInput}`);
+            
+            // 监听任务进度事件
+            evtSource.addEventListener('taskProgress', function(event) {
+                const data = JSON.parse(event.data);
+                processTaskEvent(data);
+                
+                // 如果所有任务完成，恢复按钮状态
+                if (data.type === 'ALL_COMPLETED') {
+                    document.getElementById('executeBtn').disabled = false;
+                    document.getElementById('executeBtn').innerHTML = '执行任务';
+                }
+            });
+            
+            // 监听错误
+            evtSource.addEventListener('error', function(event) {
+                console.error('SSE错误:', event);
+                document.getElementById('executeBtn').disabled = false;
+                document.getElementById('executeBtn').innerHTML = '执行任务';
+                evtSource.close();
+            });
+        });
+        
+        function processTaskEvent(event) {
+            console.log('收到事件:', event);
+            
+            switch(event.type) {
+                case 'PLAN_GENERATED':
+                    // 显示分析结果
+                    const analysisDiv = document.getElementById('analysis');
+                    analysisDiv.style.display = 'block';
+                    analysisDiv.innerHTML = `<h2>分析</h2><p>${event.analysis}</p>`;
+                    
+                    // 创建任务列表
+                    const tasksDiv = document.getElementById('tasks');
+                    tasksDiv.innerHTML = '<h2>任务</h2>';
+                    
+                    event.tasks.forEach(task => {
+                        const taskDiv = document.createElement('div');
+                        taskDiv.id = `task-${task.taskId}`;
+                        taskDiv.className = 'task pending';
+                        
+                        let dependsOnText = '';
+                        if (task.dependsOn && task.dependsOn.length > 0) {
+                            dependsOnText = `<p>依赖任务: ${task.dependsOn.join(', ')}</p>`;
+                        }
+                        
+                        taskDiv.innerHTML = `
+                            <h3>任务 ${task.taskId}: ${task.description}</h3>
+                            <p>函数: ${task.functionName}</p>
+                            <p>状态: <span class="status">等待中</span></p>
+                            ${dependsOnText}
+                            <div class="result"></div>
+                        `;
+                        tasksDiv.appendChild(taskDiv);
+                    });
+                    break;
+                    
+                case 'TASK_STARTED':
+                    const startingTask = document.getElementById(`task-${event.currentTaskId}`);
+                    if (startingTask) {
+                        startingTask.className = 'task running';
+                        startingTask.querySelector('.status').textContent = '执行中';
+                    }
+                    break;
+                    
+                case 'TASK_COMPLETED':
+                    const completedTask = document.getElementById(`task-${event.currentTaskId}`);
+                    if (completedTask) {
+                        completedTask.className = 'task completed';
+                        completedTask.querySelector('.status').textContent = '已完成';
+                        completedTask.querySelector('.result').innerHTML = 
+                            `<h4>结果:</h4><pre>${event.result}</pre>`;
+                    }
+                    break;
+                    
+                case 'TASK_FAILED':
+                    const failedTask = document.getElementById(`task-${event.currentTaskId}`);
+                    if (failedTask) {
+                        failedTask.className = 'task failed';
+                        failedTask.querySelector('.status').textContent = '失败';
+                        failedTask.querySelector('.result').innerHTML = 
+                            `<h4>错误:</h4><pre>${event.result}</pre>`;
+                    }
+                    break;
+                    
+                case 'ALL_COMPLETED':
+                    const finalResult = document.getElementById('finalResult');
+                    finalResult.style.display = 'block';
+                    finalResult.innerHTML = `<h2>最终结果</h2><pre>${event.result}</pre>`;
+                    break;
+            }
+        }
+    </script>
+</body>
+</html> 
