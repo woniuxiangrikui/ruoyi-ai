@@ -1,0 +1,15 @@
+# Python执行配置
+python:
+  execution:
+    # Python解释器路径
+    python-path: python
+    # 执行超时时间（秒）
+    timeout-seconds: 300
+    # 最大内存使用（MB）
+    max-memory-mb: 1024
+    # 临时文件目录
+    temp-dir: ${java.io.tmpdir}
+    # 是否启用虚拟环境
+    use-virtual-env: false
+    # 虚拟环境路径
+    virtual-env-path: 

@@ -9,266 +9,282 @@ import org.ruoyi.common.chat.openai.plugin.PluginAbstract;
 import org.ruoyi.common.chat.openai.plugin.PluginParam;
 import org.ruoyi.task.domain.Task;
 import org.ruoyi.task.domain.TaskPlan;
+import org.ruoyi.task.domain.TaskExecutionResult;
+import org.ruoyi.task.domain.TaskProgressEvent;
+import org.ruoyi.task.listener.TaskExecutionListener;
 import org.springframework.stereotype.Component;
 import cn.hutool.json.JSONUtil;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.util.*;
 
-@Slf4j
+/**
+ * 任务执行器
+ */
 @Component
 @RequiredArgsConstructor
+@Slf4j
 public class TaskExecutor {
     private final OpenAiClient openAiClient;
-    private final PluginRegistry pluginRegistry;
+    private final PluginRegistryService pluginRegistry;
     private final ObjectMapper objectMapper = new ObjectMapper();
     
     /**
-     * 执行任务计划
+     * 执行任务计划中的所有任务
+     *
+     * @param taskPlan 任务计划
+     * @param userInput 用户输入
+     * @return 执行结果
      */
-    public String executeTasks(TaskPlan taskPlan, String userInput) {
+    public TaskExecutionResult executeTasks(TaskPlan taskPlan, String userInput) {
         return executeTasks(taskPlan, userInput, null);
     }
     
     /**
-     * 执行任务计划（带监听器）
+     * 执行任务计划中的所有任务，并向监听器报告进度
+     *
+     * @param taskPlan 任务计划
+     * @param userInput 用户输入
+     * @param listener 任务执行监听器
+     * @return 执行结果
      */
-    public String executeTasks(TaskPlan taskPlan, String userInput, TaskExecutionListener listener) {
-        // 初始化上下文，存储任务执行结果
-        Map<Integer, String> taskResults = new HashMap<>();
-        List<Task> sortedTasks = sortTasksByDependency(taskPlan.getTasks());
-        StringBuilder finalResult = new StringBuilder();
-        
-        // 添加分析结果
-        finalResult.append("分析：").append(taskPlan.getAnalysis()).append("\n\n");
-        
-        // 通知任务计划已生成
-        if (listener != null) {
-            listener.onPlanGenerated(taskPlan);
-        }
-        
-        // 按顺序执行任务
-        for (Task task : sortedTasks) {
-            try {
-                log.info("开始执行任务: {}", task.getTaskId());
-                task.setStatus(Task.TaskStatus.RUNNING);
-                
-                // 通知任务开始
-                if (listener != null) {
-                    listener.onTaskStarted(task);
-                }
-                
-                // 准备任务输入（合并用户输入和依赖任务的结果）
-                String taskInput = prepareTaskInput(task, userInput, taskResults);
-                
-                // 执行单个任务
-                String result = executeTask(task.getFunctionName(), taskInput);
-                
-                // 存储结果
-                task.setResult(result);
-                task.setStatus(Task.TaskStatus.COMPLETED);
-                taskResults.put(task.getTaskId(), result);
-                
-                // 添加到最终结果
-                finalResult.append("任务").append(task.getTaskId()).append(": ")
-                    .append(task.getDescription()).append("\n")
-                    .append("结果: ").append(result).append("\n\n");
-                
-                // 通知任务完成
-                if (listener != null) {
-                    listener.onTaskCompleted(task, result);
-                }
-                
-                log.info("任务{}执行完成", task.getTaskId());
-            } catch (Exception e) {
-                log.error("任务{}执行失败", task.getTaskId(), e);
-                task.setStatus(Task.TaskStatus.FAILED);
-                task.setResult("执行失败: " + e.getMessage());
-                finalResult.append("任务").append(task.getTaskId()).append("执行失败: ")
-                    .append(e.getMessage()).append("\n\n");
-                
-                // 通知任务失败
-                if (listener != null) {
-                    listener.onTaskFailed(task, e.getMessage());
-                }
-            }
-        }
-        
-        // 最终整合
-        String summaryResult = generateSummary(taskPlan, taskResults, userInput);
-        finalResult.append("最终结果：\n").append(summaryResult);
-        
-        // 通知所有任务完成
-        if (listener != null) {
-            listener.onAllTasksCompleted(summaryResult);
-        }
-        
-        return finalResult.toString();
-    }
-    
-    /**
-     * 准备任务输入
-     */
-    private String prepareTaskInput(Task task, String userInput, Map<Integer, String> taskResults) {
-        StringBuilder input = new StringBuilder(userInput);
-        
-        // 添加前置任务的结果
-        if (task.getDependsOn() != null && !task.getDependsOn().isEmpty()) {
-            input.append("\n\n前置任务结果:\n");
-            for (Integer dependTaskId : task.getDependsOn()) {
-                String dependResult = taskResults.get(dependTaskId);
-                if (dependResult != null) {
-                    input.append("任务").append(dependTaskId).append("结果: ")
-                        .append(dependResult).append("\n");
-                }
-            }
-        }
-        
-        return input.toString();
-    }
-    
-    /**
-     * 执行单个任务
-     */
-    @SuppressWarnings("unchecked")
-    private <R extends PluginParam, T> String executeTask(String functionName, String taskInput) {
-        // 获取插件
-        PluginAbstract<R, T> plugin = (PluginAbstract<R, T>) pluginRegistry.getPlugin(functionName);
-        if (plugin == null) {
-            throw new RuntimeException("未找到插件: " + functionName);
-        }
-        
-        // 构建函数定义
-        Functions functions = Functions.builder()
-                .name(plugin.getFunction())
-                .description(plugin.getDescription())
-                .parameters(plugin.getParameters())
-                .build();
-                
-        // 构建消息
-        List<Message> messages = new ArrayList<>();
-        messages.add(Message.builder().role(Message.Role.USER).content(taskInput).build());
-        
-        // 构建请求
-        ChatCompletion chatCompletion = ChatCompletion.builder()
-                .messages(messages)
-                .model("gpt-4-turbo")
-                .functionCall("auto")
-                .functions(Collections.singletonList(functions))
-                .build();
-                
-        // 调用模型获取函数调用
-        ChatCompletionResponse functionCallResponse = openAiClient.chatCompletion(chatCompletion);
-        ChatChoice chatChoice = functionCallResponse.getChoices().get(0);
-        
-        if (chatChoice.getMessage().getFunctionCall() == null) {
-            // 模型选择不调用函数
-            return chatChoice.getMessage().getContent();
-        }
-        
-        // 提取参数并执行函数
-        String arguments = chatChoice.getMessage().getFunctionCall().getArguments();
-        R functionParam = (R) JSONUtil.toBean(arguments, plugin.getR());
-        T result = plugin.func(functionParam);
-        
-        // 构建函数调用记录
-        FunctionCall functionCall = FunctionCall.builder()
-                .arguments(arguments)
-                .name(plugin.getFunction())
-                .build();
-                
-        // 添加函数调用和结果到消息历史
-        messages.add(Message.builder()
-                .role(Message.Role.ASSISTANT)
-                .content("function_call")
-                .functionCall(functionCall)
-                .build());
-                
-        messages.add(Message.builder()
-                .role(Message.Role.FUNCTION)
-                .name(plugin.getFunction())
-                .content(plugin.content(result))
-                .build());
-                
-        // 让模型生成基于函数结果的回复
-        chatCompletion.setFunctionCall(null);
-        chatCompletion.setFunctions(null);
-        
-        ChatCompletionResponse response = openAiClient.chatCompletion(chatCompletion);
-        return response.getChoices().get(0).getMessage().getContent();
-    }
-    
-    /**
-     * 基于所有任务结果生成最终摘要
-     */
-    private String generateSummary(TaskPlan taskPlan, Map<Integer, String> taskResults, String userInput) {
+    public TaskExecutionResult executeTasks(TaskPlan taskPlan, String userInput, TaskExecutionListener listener) {
         try {
-            // 构建系统提示词
-            String systemPrompt = "你是一个结果整合助手。用户的原始需求是：\n\n" + userInput 
-                + "\n\n基于这个需求，系统执行了以下任务，请整合所有任务的结果，生成一个完整、清晰的最终回答：";
+            // 通知监听器任务计划生成
+            if (listener != null) {
+                TaskProgressEvent planEvent = new TaskProgressEvent(
+                    TaskProgressEvent.EventType.PLAN_GENERATED,
+                    taskPlan.getAnalysis(),
+                    taskPlan.getTasks(),
+                    null, 
+                    null,
+                    System.currentTimeMillis()
+                );
+                listener.onTaskPlanGenerated(planEvent);
+            }
             
-            // 构建任务结果描述
-            StringBuilder taskResultsStr = new StringBuilder();
-            for (Task task : taskPlan.getTasks()) {
-                String result = taskResults.get(task.getTaskId());
-                if (result != null) {
-                    taskResultsStr.append("任务").append(task.getTaskId()).append(": ")
-                        .append(task.getDescription()).append("\n")
-                        .append("结果: ").append(result).append("\n\n");
+            List<Task> tasks = taskPlan.getTasks();
+            if (tasks == null || tasks.isEmpty()) {
+                log.warn("任务计划中没有任务需要执行");
+                TaskExecutionResult emptyResult = new TaskExecutionResult(true, "没有任务需要执行", null);
+                
+                // 通知监听器所有任务完成
+                if (listener != null) {
+                    TaskProgressEvent completedEvent = new TaskProgressEvent(
+                        TaskProgressEvent.EventType.ALL_COMPLETED,
+                        taskPlan.getAnalysis(),
+                        tasks,
+                        null, 
+                        "没有任务需要执行",
+                        System.currentTimeMillis()
+                    );
+                    listener.onAllTasksCompleted(completedEvent);
+                }
+                
+                return emptyResult;
+            }
+            
+            log.info("开始执行任务计划，共 {} 个任务", tasks.size());
+            List<Object> results = new ArrayList<>();
+            
+            // 顺序执行所有任务
+            for (Task task : tasks) {
+                try {
+                    String taskId = task.getId();
+                    log.info("开始执行任务: {}, 插件: {}, 功能: {}", 
+                              taskId, task.getPluginName(), task.getFunction());
+                    
+                    // 通知监听器任务开始
+                    if (listener != null) {
+                        TaskProgressEvent startEvent = new TaskProgressEvent(
+                            TaskProgressEvent.EventType.TASK_STARTED,
+                            taskPlan.getAnalysis(),
+                            tasks,
+                            taskId, 
+                            null,
+                            System.currentTimeMillis()
+                        );
+                        listener.onTaskStarted(startEvent);
+                    }
+                    
+                    // 获取插件定义
+                    PluginDefinition pluginDef = pluginRegistry.getPlugin(task.getPluginName());
+                    if (pluginDef == null) {
+                        String error = "未找到插件: " + task.getPluginName();
+                        log.error(error);
+                        
+                        // 通知监听器任务失败
+                        if (listener != null) {
+                            TaskProgressEvent failedEvent = new TaskProgressEvent(
+                                TaskProgressEvent.EventType.TASK_FAILED,
+                                taskPlan.getAnalysis(),
+                                tasks,
+                                taskId, 
+                                error,
+                                System.currentTimeMillis()
+                            );
+                            listener.onTaskFailed(failedEvent, new RuntimeException(error));
+                        }
+                        
+                        continue;
+                    }
+                    
+                    // 获取函数参数
+                    Object paramObj = objectMapper.convertValue(
+                        task.getParameters(), 
+                        ((PluginAbstract<?>) pluginDef).getParamClass()
+                    );
+                    
+                    // 执行插件功能
+                    Method method = pluginDef.getClass().getMethod(task.getFunction(), ((PluginAbstract<?>) pluginDef).getParamClass());
+                    Object result = method.invoke(pluginDef, paramObj);
+                    results.add(result);
+                    
+                    log.info("任务 {} 执行成功", taskId);
+                    
+                    // 通知监听器任务完成
+                    if (listener != null) {
+                        TaskProgressEvent completedEvent = new TaskProgressEvent(
+                            TaskProgressEvent.EventType.TASK_COMPLETED,
+                            taskPlan.getAnalysis(),
+                            tasks,
+                            taskId, 
+                            generateResultSummary(task, result),
+                            System.currentTimeMillis()
+                        );
+                        listener.onTaskCompleted(completedEvent, result);
+                    }
+                    
+                } catch (Exception e) {
+                    String error = "执行任务 " + task.getId() + " 失败: " + e.getMessage();
+                    log.error(error, e);
+                    
+                    // 通知监听器任务失败
+                    if (listener != null) {
+                        TaskProgressEvent failedEvent = new TaskProgressEvent(
+                            TaskProgressEvent.EventType.TASK_FAILED,
+                            taskPlan.getAnalysis(),
+                            tasks,
+                            task.getId(), 
+                            error,
+                            System.currentTimeMillis()
+                        );
+                        listener.onTaskFailed(failedEvent, e);
+                    }
                 }
             }
             
-            // 构建消息
-            List<Message> messages = new ArrayList<>();
-            messages.add(Message.builder().role(Message.Role.SYSTEM).content(systemPrompt).build());
-            messages.add(Message.builder().role(Message.Role.USER).content(taskResultsStr.toString()).build());
+            // 生成总结果
+            String resultSummary = generateFinalSummary(taskPlan, results);
+            TaskExecutionResult executionResult = new TaskExecutionResult(true, resultSummary, results);
             
-            // 调用模型
-            ChatCompletion chatCompletion = ChatCompletion.builder()
-                .messages(messages)
-                .model("gpt-4-turbo")
-                .build();
-                
-            ChatCompletionResponse response = openAiClient.chatCompletion(chatCompletion);
-            return response.getChoices().get(0).getMessage().getContent();
+            // 通知监听器所有任务完成
+            if (listener != null) {
+                TaskProgressEvent allCompletedEvent = new TaskProgressEvent(
+                    TaskProgressEvent.EventType.ALL_COMPLETED,
+                    taskPlan.getAnalysis(),
+                    tasks,
+                    null, 
+                    resultSummary,
+                    System.currentTimeMillis()
+                );
+                listener.onAllTasksCompleted(allCompletedEvent);
+            }
+            
+            return executionResult;
             
         } catch (Exception e) {
-            log.error("生成最终摘要失败", e);
-            return "无法生成最终摘要: " + e.getMessage();
+            String error = "执行任务计划失败: " + e.getMessage();
+            log.error(error, e);
+            
+            // 通知监听器出现错误
+            if (listener != null) {
+                TaskProgressEvent failedEvent = new TaskProgressEvent(
+                    TaskProgressEvent.EventType.TASK_FAILED,
+                    taskPlan.getAnalysis(),
+                    taskPlan.getTasks(),
+                    null, 
+                    error,
+                    System.currentTimeMillis()
+                );
+                listener.onTaskFailed(failedEvent, e);
+            }
+            
+            return new TaskExecutionResult(false, error, null);
         }
     }
     
     /**
-     * 按依赖关系排序任务
+     * 生成单个任务的结果摘要
      */
-    private List<Task> sortTasksByDependency(List<Task> tasks) {
-        Map<Integer, Task> taskMap = new HashMap<>();
-        for (Task task : tasks) {
-            taskMap.put(task.getTaskId(), task);
-        }
+    private String generateResultSummary(Task task, Object result) {
+        StringBuilder summary = new StringBuilder();
+        
+        // 根据不同的插件类型生成不同的摘要
+        if (task.getPluginName().contains("Python")) {
+            Map<String, Object> params = task.getParameters();
+            summary.append("Python代码已生成，处理文件：").append(params.get("filePath"));
             
-        List<Task> result = new ArrayList<>();
-        Set<Integer> visited = new HashSet<>();
-        
-        for (Task task : tasks) {
-            if (!visited.contains(task.getTaskId())) {
-                dfs(task, taskMap, visited, result);
+            if (params.containsKey("analysisType")) {
+                summary.append("，分析类型：").append(params.get("analysisType"));
             }
-        }
-        
-        return result;
-    }
-    
-    private void dfs(Task task, Map<Integer, Task> taskMap, Set<Integer> visited, List<Task> result) {
-        visited.add(task.getTaskId());
-        
-        if (task.getDependsOn() != null) {
-            for (Integer dependId : task.getDependsOn()) {
-                if (!visited.contains(dependId) && taskMap.containsKey(dependId)) {
-                    dfs(taskMap.get(dependId), taskMap, visited, result);
+            
+            if (result instanceof String && ((String) result).length() > 100) {
+                summary.append("。生成代码长度：").append(((String) result).length()).append("字符");
+            }
+        } else if (task.getPluginName().contains("命令执行")) {
+            Map<String, Object> params = task.getParameters();
+            summary.append("命令已执行：").append(params.get("command"));
+            
+            if (result instanceof String) {
+                String cmdResult = (String) result;
+                if (cmdResult.length() > 100) {
+                    summary.append("。执行结果长度：").append(cmdResult.length()).append("字符");
+                } else {
+                    summary.append("。执行结果：").append(cmdResult);
                 }
             }
+        } else {
+            summary.append("任务执行完成，ID：").append(task.getId());
+            if (result != null) {
+                summary.append("，结果类型：").append(result.getClass().getSimpleName());
+            }
         }
         
-        result.add(task);
+        return summary.toString();
+    }
+    
+    /**
+     * 生成最终的结果摘要
+     */
+    private String generateFinalSummary(TaskPlan taskPlan, List<Object> results) {
+        StringBuilder summary = new StringBuilder();
+        summary.append(taskPlan.getAnalysis());
+        
+        if (results.isEmpty()) {
+            summary.append(" 没有得到任何结果。");
+            return summary.toString();
+        }
+        
+        summary.append(" 执行了").append(results.size()).append("个任务。");
+        
+        // 检查是否有Python任务
+        boolean hasPythonTask = taskPlan.getTasks().stream()
+            .anyMatch(task -> task.getPluginName().contains("Python"));
+        
+        // 检查是否有命令执行任务
+        boolean hasCmdTask = taskPlan.getTasks().stream()
+            .anyMatch(task -> task.getPluginName().contains("命令执行"));
+        
+        if (hasPythonTask) {
+            summary.append("生成了Python代码用于数据处理。");
+        }
+        
+        if (hasCmdTask) {
+            summary.append("执行了系统命令。");
+        }
+        
+        return summary.toString();
     }
 } 
